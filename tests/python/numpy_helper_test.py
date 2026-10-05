@@ -256,6 +256,65 @@ class TestNumpyHelper:
             == 0xFF
         )
 
+    def test_to_float8e8m0_float32_subnormal(self) -> None:
+        # float32 subnormals lie in (0, 2**-126), between the two smallest
+        # float8e8m0 values 2**-127 (code 0) and 2**-126 (code 1).
+        x = np.array(
+            [0x00080000, 0x00400000, 0x00400001, 0x00600000, 0x007FFFFF],
+            dtype=np.uint32,
+        ).view(np.float32)
+        # 2**-130, 2**-127, 2**-127 * (1 + 2**-22), 1.5 * 2**-127, just below 2**-126
+        np.testing.assert_array_equal(
+            numpy_helper.to_float8e8m0(x, round_mode="up").view(np.uint8),
+            [0, 0, 1, 1, 1],
+        )
+        np.testing.assert_array_equal(
+            numpy_helper.to_float8e8m0(x, round_mode="down").view(np.uint8),
+            [0, 0, 0, 0, 0],
+        )
+        np.testing.assert_array_equal(
+            numpy_helper.to_float8e8m0(x, round_mode="nearest").view(np.uint8),
+            [0, 0, 0, 1, 1],
+        )
+
+    def test_to_float8e8m0_float64(self) -> None:
+        # float64 inputs are rounded once, not through float32 first. Both
+        # values below round to a power of 2 when cast to float32.
+        x = np.array([np.nextafter(2.0**-126, 0), 1.0 + 2.0**-30])
+        np.testing.assert_array_equal(
+            numpy_helper.to_float8e8m0(x, round_mode="down").view(np.uint8),
+            [0, 127],
+        )
+        np.testing.assert_array_equal(
+            numpy_helper.to_float8e8m0(x, round_mode="up").view(np.uint8),
+            [1, 128],
+        )
+        # Values beyond the float32 range saturate instead of becoming NaN.
+        large = np.array([1e39, 2.0**128, 1e300])
+        for mode in ("up", "down", "nearest"):
+            np.testing.assert_array_equal(
+                numpy_helper.to_float8e8m0(large, saturate=True, round_mode=mode).view(
+                    np.uint8
+                ),
+                [0xFE, 0xFE, 0xFE],
+                err_msg=f"mode={mode}",
+            )
+            np.testing.assert_array_equal(
+                numpy_helper.to_float8e8m0(large, saturate=False, round_mode=mode).view(
+                    np.uint8
+                ),
+                [0xFF, 0xFF, 0xFF],
+                err_msg=f"mode={mode}",
+            )
+        # Values below the float32 range map to the smallest value, 2**-127.
+        tiny = np.array([2.0**-128, 1e-300, 5e-324])
+        for mode in ("up", "down", "nearest"):
+            np.testing.assert_array_equal(
+                numpy_helper.to_float8e8m0(tiny, round_mode=mode).view(np.uint8),
+                [0, 0, 0],
+                err_msg=f"mode={mode}",
+            )
+
     def test_from_array_object_invalid_type(self) -> None:
         a = np.array([42], dtype=object)
         with pytest.raises(NotImplementedError, match="int"):

@@ -24,8 +24,8 @@ def to_float8e8m0(
     saturate: bool = True,
     round_mode: str = "up",
 ) -> np.ndarray:
-    """Convert float32 NumPy array to float8e8m0 representation. If the input
-    is not a float32 array, it will be cast to one first.
+    """Convert a NumPy array to float8e8m0 representation. The input is cast
+    to float64 first, which is exact for float16, bfloat16 and float32 inputs.
 
     Args:
         x: Input array to convert.
@@ -35,61 +35,41 @@ def to_float8e8m0(
     Returns:
         np.ndarray: Array of ml_dtypes.float8_e8m0fnu values.
     """
-    x_f32 = np.asarray(x, dtype=np.float32)
-    f_bits = x_f32.view(np.uint32)
+    # Every float32 value, including subnormals, is a normal float64 value.
+    # Working on float64 bits keeps the significand in the form 1.f, so the
+    # rounding bit positions are the same for every finite input, and float64
+    # inputs are rounded once instead of being rounded to float32 first.
+    x_f64 = np.asarray(x, dtype=np.float64)
+    f_bits = x_f64.view(np.uint64)
 
-    # Extract exponent bits
-    exponent = (f_bits >> 23) & 0xFF
-    exponent = exponent.astype(
-        np.uint16
-    )  # use uint16 to prevent overflow during computation
+    # Extract exponent and mantissa bits
+    exponent = ((f_bits >> 52) & 0x7FF).astype(np.int32)
+    mantissa = f_bits & 0xFFFFFFFFFFFFF
 
     # Identify NaN or Inf
-    special_mask = exponent == 0xFF  # noqa: PLR2004
-    output = np.zeros_like(exponent, dtype=np.uint8)
-    output[special_mask] = 0xFF  # Preserve NaN/Inf as max exponent
+    special_mask = exponent == 0x7FF  # noqa: PLR2004
 
-    # Process normal numbers
-    normal_mask = ~special_mask
+    # Change the exponent bias from 1023 (float64) to 127 (float8e8m0)
+    exponent -= 1023 - 127
 
     if round_mode == "nearest":
-        # Get guard, round, sticky, and least significant bits
-        g = ((f_bits & 0x400000) > 0).astype(np.uint8)
-        r = ((f_bits & 0x200000) > 0).astype(np.uint8)
-        s = ((f_bits & 0x1FFFFF) > 0).astype(np.uint8)
-        lsb = (exponent > 0).astype(np.uint8)
-
-        round_up = (g == 1) & ((r == 1) | (s == 1) | (lsb == 1))
-
-        increment = np.zeros_like(exponent)
-        increment[round_up & normal_mask] = 1
-
-        if saturate:
-            max_mask = (exponent == 0xFE) & round_up & normal_mask  # noqa: PLR2004
-            increment[max_mask] = 0  # Don't overflow past max value
-
-        exponent += increment
-
+        # Round up if the mantissa is at least 0.5 (ties round up)
+        round_up = (mantissa & 0x8000000000000) > 0
     elif round_mode == "up":
-        has_fraction = (f_bits & 0x7FFFFF) > 0
-        round_up = has_fraction & normal_mask
-
-        if saturate:
-            max_mask = (exponent == 0xFE) & round_up  # noqa: PLR2004
-            round_up[max_mask] = False
-
-        exponent += round_up.astype(np.uint16)
-
+        round_up = mantissa > 0
     elif round_mode == "down":
-        pass  # No rounding needed
-
+        round_up = np.zeros_like(special_mask)
     else:
         raise ValueError(f"Unsupported rounding mode: {round_mode}")
 
-    # Clip exponent to uint8 range
-    exponent = exponent.astype(np.uint8)
+    exponent += round_up
 
-    output[normal_mask] = exponent[normal_mask]
+    # Values below 2**-127 map to the smallest float8e8m0 value (2**-127)
+    exponent = np.maximum(exponent, 0)
+    # Values above 2**127 saturate at the max value or overflow to NaN
+    exponent = np.where(exponent > 0xFE, 0xFE if saturate else 0xFF, exponent)  # noqa: PLR2004
+    # Preserve NaN/Inf as max exponent
+    output = np.where(special_mask, 0xFF, exponent).astype(np.uint8)
 
     return output.view(ml_dtypes.float8_e8m0fnu)
 
